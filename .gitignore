@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+data/*.sqlite3*
+examples/v1_evaluation.json
+examples/v2_evaluation.json
+examples/correction_response.json
+examples/stale_response.json
