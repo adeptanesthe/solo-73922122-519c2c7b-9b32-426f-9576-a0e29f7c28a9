@@ -7,3 +7,4 @@ examples/v1_evaluation.json
 examples/v2_evaluation.json
 examples/correction_response.json
 examples/stale_response.json
+examples/offline_*_response.json

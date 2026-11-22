@@ -13,7 +13,12 @@ import numpy as np
 
 from .database import connect, read_snapshot, write_transaction
 from .grouping import build_groups, changed_membership_ids, group_index, normalize_pair
-from .models import BatchCreateRequest, CorrectionRequest
+from .models import BatchCreateRequest, CorrectionRequest, OfflinePackageRequest
+from .offline_package import (
+    NO_DISABLED,
+    solve_minimum_package,
+    squared_distance_matrix,
+)
 from .predictions import predict_nearest_outside, summarize_groups
 
 SINGLE_GROUP_MESSAGE = (
@@ -23,11 +28,18 @@ SINGLE_GROUP_MESSAGE = (
 
 
 class ServiceError(Exception):
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 def _now() -> str:
@@ -439,3 +451,218 @@ def apply_correction(
         "overall_accuracy": overall,
         "version_created_at": version_created_at,
     }
+
+
+def _group_label_for(
+    group_of: dict[str, int], groups: Sequence[Sequence[str]], photo_id: str
+) -> str | None:
+    """Camera-group label = smallest candidate reference ID in the group."""
+    index = group_of.get(photo_id)
+    if index is None:
+        return None
+    return groups[index][0]
+
+
+def build_offline_package(
+    db_path: str, batch_id: str, request: OfflinePackageRequest
+) -> dict[str, Any]:
+    """Select the minimum offline reference package for one request.
+
+    The whole computation reads a single WAL snapshot and never takes a write
+    lock, so reviewer corrections can still commit while the package is being
+    solved. Same-group relationships between the selected photos are then
+    re-checked against the latest committed version: any change is reported as
+    a conflict, otherwise the answer is stamped with that newer version.
+    """
+    connection = connect(db_path)
+    try:
+        with read_snapshot(connection) as snapshot:
+            batch = snapshot.execute(
+                "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if batch is None:
+                raise ServiceError(
+                    404, "batch_not_found", f"batch {batch_id!r} not found"
+                )
+            snapshot_version = batch["current_version"]
+            if snapshot_version != request.expected_version:
+                raise ServiceError(
+                    409,
+                    "version_conflict",
+                    "expected_version does not match the current batch version",
+                    details={
+                        "expected_version": request.expected_version,
+                        "current_version": snapshot_version,
+                    },
+                )
+
+            rows = snapshot.execute(
+                "SELECT photo_id, species, features FROM photos "
+                "WHERE batch_id = ? ORDER BY photo_id",
+                (batch_id,),
+            ).fetchall()
+            all_photo_ids = [row["photo_id"] for row in rows]
+            species_by_id = {row["photo_id"]: row["species"] for row in rows}
+            features_by_id = {
+                row["photo_id"]: json.loads(row["features"]) for row in rows
+            }
+            groups = _load_groups(snapshot, batch_id)
+
+        known = set(all_photo_ids)
+        unknown = sorted(
+            photo_id
+            for photo_id in (*request.candidate_photo_ids, *request.verification_photo_ids)
+            if photo_id not in known
+        )
+        if unknown:
+            raise ServiceError(
+                422,
+                "unknown_photo",
+                "every candidate and verification photo must exist in this batch",
+                details={"unknown_photo_ids": unknown},
+            )
+
+        candidate_ids = sorted(request.candidate_photo_ids)
+        verification_ids = sorted(request.verification_photo_ids)
+        group_of = group_index(groups)
+
+        candidate_group_indices = sorted({group_of[photo_id] for photo_id in candidate_ids})
+        candidate_group = [group_of[photo_id] for photo_id in candidate_ids]
+        verification_group = [group_of[photo_id] for photo_id in verification_ids]
+        candidate_species = [species_by_id[photo_id] for photo_id in candidate_ids]
+
+        involved_ids = candidate_ids + verification_ids
+        involved_matrix = np.asarray(
+            [features_by_id[photo_id] for photo_id in involved_ids], dtype=np.int64
+        )
+        full_distances = squared_distance_matrix(involved_matrix)
+        n_candidates = len(candidate_ids)
+        # Rows 0..n-1 are candidates; the remaining rows are the verification
+        # photos in the same sorted order as verification_ids.
+        distances = full_distances[n_candidates:, :n_candidates]
+
+        selected, verdicts = solve_minimum_package(
+            candidate_ids,
+            verification_ids,
+            candidate_group,
+            verification_group,
+            candidate_species,
+            distances,
+            candidate_group_indices,
+        )
+        selected_ids = [candidate_ids[index] for index in selected]
+
+        # Re-check same-group relationships among the selected photos against
+        # the latest committed state. The snapshot transaction has ended, so a
+        # correction committing in between is visible here.
+        latest = connection.execute(
+            "SELECT current_version, version_created_at FROM batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if latest is None:
+            raise ServiceError(404, "batch_not_found", f"batch {batch_id!r} not found")
+        recheck_version = latest["current_version"]
+        recheck_groups = _load_groups(connection, batch_id)
+        recheck_group_of = group_index(recheck_groups)
+
+        def signature(photo_ids: Sequence[str], mapping: dict[str, int]) -> set[frozenset[str]]:
+            return {
+                frozenset((a, b))
+                for a in photo_ids
+                for b in photo_ids
+                if a < b and mapping[a] == mapping[b]
+            }
+
+        if signature(selected_ids, group_of) != signature(selected_ids, recheck_group_of):
+            raise ServiceError(
+                409,
+                "group_relationship_changed",
+                "a correction changed same-group relationships between selected "
+                "photos while the package was being solved; retry against the "
+                "returned version",
+                details={
+                    "expected_version": request.expected_version,
+                    "current_version": recheck_version,
+                },
+            )
+
+        required_size = len(selected_ids)
+        if required_size > request.capacity:
+            raise ServiceError(
+                409,
+                "capacity_exceeded",
+                "the smallest package that survives every group outage exceeds "
+                "the requested capacity",
+                details={
+                    "capacity": request.capacity,
+                    "required_size": required_size,
+                    "version": recheck_version,
+                },
+            )
+
+        def package_photo(
+            photo_id: str,
+            mapping: dict[str, int],
+            labeled_groups: Sequence[Sequence[str]],
+        ) -> dict[str, Any]:
+            return {
+                "photo_id": photo_id,
+                "features": features_by_id[photo_id],
+                "species": species_by_id[photo_id],
+                "group_id": _group_label_for(mapping, labeled_groups, photo_id),
+            }
+
+        scenario_output: list[dict[str, Any]] = []
+        for verdict in verdicts:
+            full_index = verdict["full_index"]
+            package_index = verdict["package_index"]
+            disabled = verdict["disabled_group"]
+            scenario_output.append(
+                {
+                    "scenario": "all_enabled" if disabled == NO_DISABLED else "group_disabled",
+                    "disabled_group_id": (
+                        None
+                        if disabled == NO_DISABLED
+                        else groups[disabled][0]
+                    ),
+                    "verification_photo_id": verdict["verification_photo_id"],
+                    "full_nearest_photo_id": (
+                        None if full_index is None else candidate_ids[full_index]
+                    ),
+                    "full_species": (
+                        None
+                        if full_index is None
+                        else candidate_species[full_index]
+                    ),
+                    "package_nearest_photo_id": (
+                        None if package_index is None else candidate_ids[package_index]
+                    ),
+                    "package_species": (
+                        None
+                        if package_index is None
+                        else candidate_species[package_index]
+                    ),
+                }
+            )
+
+        return {
+            "batch_id": batch_id,
+            "expected_version": request.expected_version,
+            "version": recheck_version,
+            "capacity": request.capacity,
+            "package_size": required_size,
+            "candidate_photo_ids": candidate_ids,
+            "candidate_groups": [
+                package_photo(photo_id, group_of, groups)
+                for photo_id in candidate_ids
+            ],
+            "verification_photo_ids": verification_ids,
+            "package_photos": [
+                package_photo(photo_id, recheck_group_of, recheck_groups)
+                for photo_id in selected_ids
+            ],
+            "scenarios": scenario_output,
+            "version_created_at": latest["version_created_at"],
+        }
+    finally:
+        connection.close()

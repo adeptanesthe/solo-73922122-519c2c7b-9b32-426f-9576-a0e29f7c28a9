@@ -18,8 +18,16 @@ from .models import (
     CorrectionOut,
     CorrectionRequest,
     EvaluationOut,
+    OfflinePackageOut,
+    OfflinePackageRequest,
 )
-from .service import ServiceError, apply_correction, create_batch, load_evaluation
+from .service import (
+    ServiceError,
+    apply_correction,
+    build_offline_package,
+    create_batch,
+    load_evaluation,
+)
 
 DEFAULT_DB_PATH = "data/evaluations.sqlite3"
 
@@ -56,10 +64,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(ServiceError)
     async def _service_error(_: Request, exc: ServiceError) -> JSONResponse:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"error": exc.code, "message": exc.message},
-        )
+        content: dict = {"error": exc.code, "message": exc.message}
+        if exc.details:
+            content["details"] = exc.details
+        return JSONResponse(status_code=exc.status_code, content=content)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
@@ -103,6 +111,17 @@ def create_app() -> FastAPI:
         batch_id: str, payload: CorrectionRequest, path: str = Depends(db_path)
     ) -> dict:
         return apply_correction(path, batch_id, payload)
+
+    @app.post(
+        "/batches/{batch_id}/offline-package",
+        response_model=OfflinePackageOut,
+        tags=["offline-package"],
+        summary="Build the minimum offline reference package for a patrol tablet",
+    )
+    def offline_package(
+        batch_id: str, payload: OfflinePackageRequest, path: str = Depends(db_path)
+    ) -> dict:
+        return build_offline_package(path, batch_id, payload)
 
     return app
 

@@ -134,3 +134,65 @@ class CorrectionOut(BaseModel):
     message: str | None = None
     overall_accuracy: float | None = None
     version_created_at: str
+
+
+class OfflinePackageRequest(BaseModel):
+    """Selection request for an offline reference package."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1, strict=True)
+    candidate_photo_ids: list[str] = Field(min_length=1, max_length=16)
+    verification_photo_ids: list[str] = Field(min_length=1, max_length=40)
+    capacity: int = Field(ge=1, strict=True)
+
+    @model_validator(mode="after")
+    def _validate_package_request(self) -> "OfflinePackageRequest":
+        candidates = self.candidate_photo_ids
+        verifications = self.verification_photo_ids
+        if any(not photo_id.strip() for photo_id in candidates):
+            raise ValueError("candidate photo IDs must not be blank")
+        if any(not photo_id.strip() for photo_id in verifications):
+            raise ValueError("verification photo IDs must not be blank")
+        if len(set(candidates)) != len(candidates):
+            raise ValueError("candidate photo IDs must be unique")
+        if len(set(verifications)) != len(verifications):
+            raise ValueError("verification photo IDs must be unique")
+        overlap = set(candidates) & set(verifications)
+        if overlap:
+            raise ValueError(
+                "a photo cannot be both a candidate reference and a verification photo: "
+                f"{sorted(overlap)!r}"
+            )
+        return self
+
+
+class PackagePhotoOut(BaseModel):
+    photo_id: str
+    features: list[int]
+    species: str
+    group_id: str
+
+
+class ScenarioResultOut(BaseModel):
+    scenario: Literal["all_enabled", "group_disabled"]
+    disabled_group_id: str | None = None
+    verification_photo_id: str
+    full_nearest_photo_id: str | None
+    full_species: str | None
+    package_nearest_photo_id: str | None
+    package_species: str | None
+
+
+class OfflinePackageOut(BaseModel):
+    batch_id: str
+    expected_version: int
+    version: int
+    capacity: int
+    package_size: int
+    candidate_photo_ids: list[str]
+    candidate_groups: list[PackagePhotoOut]
+    verification_photo_ids: list[str]
+    package_photos: list[PackagePhotoOut]
+    scenarios: list[ScenarioResultOut]
+    version_created_at: str

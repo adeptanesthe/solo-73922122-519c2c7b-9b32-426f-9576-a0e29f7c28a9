@@ -1,0 +1,6 @@
+{
+  "expected_version": 1,
+  "candidate_photo_ids": ["r1", "r2", "r3", "r4", "r5"],
+  "verification_photo_ids": ["v1", "v2"],
+  "capacity": 3
+}
